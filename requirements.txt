@@ -10,3 +10,4 @@ pydantic
 opencv-python
 mediapipe
 psycopg2-binary
+pytubefix

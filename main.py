@@ -8,7 +8,7 @@ import cv2
 from typing import List, Dict, Any, Tuple, Optional, Iterable
 import math
 from db_models import Base, VideoAnalysis
-from youconnection import youtube_search, enrich_videos
+from youconnection import youtube_search, enrich_videos, API_KEY
 from transaction import download_video_pytube
 from yolo_labels import YOLOVideoDetectorLite
 from media_lite import MediaPipeHandsArmsLite
@@ -17,6 +17,7 @@ from sqlalchemy import text as sql_text
 
 load_dotenv()
 
+print(API_KEY)
 OUT_DIR      = os.getenv("OUT_DIR", "data_temp")
 WITH_AUDIO   = os.getenv("DOWNLOAD_WITH_AUDIO", "0") == "1"
 
@@ -35,7 +36,7 @@ USE_DB       = os.getenv("USE_DB", "1") == "1"
 SKIP_ALREADY_PROCESSED = os.getenv("SKIP_ALREADY_PROCESSED", "1") == "1"
 
 CLEAN_DET_CONF_MIN = float(os.getenv("CLEAN_DET_CONF_MIN", "0.30"))
-DET_KEEP_LABELS    = set(json.loads(os.getenv("DET_KEEP_LABELS", '["person"]')))
+DET_KEEP_LABELS = set(json.loads(os.getenv("DET_KEEP_LABELS", '[]')))
 HAND_KEEP_LABELS   = set(json.loads(os.getenv("HAND_KEEP_LABELS", '["Left","Right"]')))
 HAND_REQUIRED_POINTS = tuple(json.loads(os.getenv("HAND_REQUIRED_POINTS", '["wrist","index_tip"]')))
 DROP_EMPTY         = os.getenv("DROP_EMPTY", "1") == "1"
@@ -44,7 +45,7 @@ CLEAN_AFTER_SAVE = os.getenv("CLEAN_AFTER_SAVE", "1") == "1"
 CLEAN_ON_SKIP    = os.getenv("CLEAN_ON_SKIP", "1") == "1"
 
 
-GATE_ENABLE   = os.getenv("GATE_ENABLE", "1") == "1"  
+GATE_ENABLE   = os.getenv("GATE_ENABLE", "1") == "0"  
 MIN_DUR       = int(os.getenv("MIN_DUR_SEC", "15"))
 MAX_DUR       = int(os.getenv("MAX_DUR_SEC", "300"))
 ALLOW_VERTICAL= os.getenv("ALLOW_VERTICAL", "0") == "1"
@@ -73,6 +74,42 @@ db_port = os.getenv("DATABASE_PORT") or os.getenv("PORT")
 db_name = os.getenv("DATABASE_NAME")
 db_username = os.getenv("DATABASE_USERNAME")
 db_password = os.getenv("DATABASE_PASSWORD")
+
+
+DATOS_FILE = "datos.txt"
+
+def load_ids_from_file(path: str = DATOS_FILE) -> List[str]:
+    """
+    Lee IDs (o URLs) de YouTube desde un archivo de texto.
+    - Una entrada por línea.
+    - Se permiten líneas vacías o comentarios con '#'.
+    - Si la línea es una URL, se extrae el ID con youtube_id_from_url.
+    - Si la línea parece un ID, se usa tal cual.
+    """
+    if not os.path.exists(path):
+        return []
+
+    ids: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+
+            # Si viene URL, extraemos el ID
+            if "youtube.com" in raw or "youtu.be" in raw:
+                vid = youtube_id_from_url(raw)
+            else:
+                # Asumimos que es un ID directo
+                vid = raw
+
+            if vid and vid not in ids:
+                ids.append(vid)
+
+    print(f"[FILE] Leídos {len(ids)} IDs desde {path}")
+    return ids
+
+
 
 db = Database(
     host=db_host,
@@ -340,7 +377,7 @@ def filter_frame(
 def filter_stream(frames: List[Dict[str, Any]], frame_size: Tuple[int, int]) -> List[Dict[str, Any]]:
     result = []
     for fr in frames:
-        f = filter_frame(fr, frame_size=frame_size)
+        f = filter_frame(fr, frame_size=frame_size, det_keep_labels=None)  # o set()
         if f is not None:
             result.append(f)
     return result
@@ -493,32 +530,101 @@ def process_one(url: str, enriched_info: Optional[dict] = None):
 
 
 
-def process_ids(video_ids: List[str]):
+# def process_ids(video_ids: List[str]):
+#     if not video_ids:
+#         print("[INFO] Lista de IDs vacía.")
+#         return
+    
+#     enriched = enrich_videos(video_ids) or {}
+
+#     accepted: List[str] = []
+#     for vid in video_ids:
+#         info = enriched.get(vid)
+#         if info is None:
+#             print(f"[GATE] sin metadata -> skip: {vid}")
+#             continue
+#         if passes_gates(info):
+#             accepted.append(vid)
+#         else:
+#             print(f"[GATE] no pasa filtros -> skip: {vid}")
+
+#     total = 0
+#     for vid in accepted:
+#         if total >= MAX_VIDEOS_PER_RUN:
+#             print(f"[STOP] Alcanzado MAX_VIDEOS_PER_RUN={MAX_VIDEOS_PER_RUN}")
+#             break
+#         url = build_url(vid)
+#         try:
+#             process_one(url, enriched_info=enriched.get(vid))
+#             total += 1
+#             if SLEEP_BETWEEN > 0:
+#                 time.sleep(SLEEP_BETWEEN)
+#         except Exception as e:
+#             print(f"[ERROR] Falló {url}: {e}")
+
+#     print(f"[DONE] Procesados {total}/{len(accepted)} aceptados (de {len(video_ids)} IDs)")
+
+def process_ids(
+    video_ids: List[str],
+    use_gates: bool = True,
+    use_enrich: bool = True,
+):
+    """
+    Procesa una lista de IDs de YouTube.
+
+    - use_enrich=True  → llama a enrich_videos() para obtener metadata (API YouTube).
+    - use_enrich=False → NO llama a enrich_videos, no hay llamadas a la API.
+    - use_gates=True   → aplica passes_gates(info) usando la metadata.
+    - use_gates=False  → no aplica ningún filtro, procesa todos los IDs recibidos.
+
+    Nota: no tiene sentido use_gates=True y use_enrich=False al mismo tiempo,
+    porque sin metadata no se puede gatear. En ese caso se desactivan los gates.
+    """
     if not video_ids:
         print("[INFO] Lista de IDs vacía.")
         return
-    
-    enriched = enrich_videos(video_ids) or {}
+
+    # Si alguien pone gates sin enrich, avisa y desactiva gates
+    if use_gates and not use_enrich:
+        print("[WARN] use_gates=True pero use_enrich=False; no se puede aplicar gate sin metadata.")
+        print("[WARN] Desactivando gates para esta corrida.")
+        use_gates = False
+
+    enriched: Dict[str, dict] = {}
+
+    if use_enrich:
+        print(f"[ENRICH] Consultando metadata para {len(video_ids)} videos…")
+        enriched = enrich_videos(video_ids) or {}
+    else:
+        print("[ENRICH] Saltado (use_enrich=False). No se harán llamadas a la API.")
+        enriched = {}
 
     accepted: List[str] = []
-    for vid in video_ids:
-        info = enriched.get(vid)
-        if info is None:
-            print(f"[GATE] sin metadata -> skip: {vid}")
-            continue
-        if passes_gates(info):
-            accepted.append(vid)
-        else:
-            print(f"[GATE] no pasa filtros -> skip: {vid}")
+
+    if not use_gates:
+        print("[GATE] Desactivados para esta corrida (procesando todos los IDs).")
+        accepted = list(video_ids)
+    else:
+        for vid in video_ids:
+            info = enriched.get(vid)
+            if info is None:
+                print(f"[GATE] sin metadata -> skip: {vid}")
+                continue
+            if passes_gates(info):
+                accepted.append(vid)
+            else:
+                print(f"[GATE] no pasa filtros -> skip: {vid}")
 
     total = 0
     for vid in accepted:
         if total >= MAX_VIDEOS_PER_RUN:
             print(f"[STOP] Alcanzado MAX_VIDEOS_PER_RUN={MAX_VIDEOS_PER_RUN}")
             break
+
         url = build_url(vid)
         try:
-            process_one(url, enriched_info=enriched.get(vid))
+            info = enriched.get(vid) if use_enrich else None
+            process_one(url, enriched_info=info)
             total += 1
             if SLEEP_BETWEEN > 0:
                 time.sleep(SLEEP_BETWEEN)
@@ -526,6 +632,7 @@ def process_ids(video_ids: List[str]):
             print(f"[ERROR] Falló {url}: {e}")
 
     print(f"[DONE] Procesados {total}/{len(accepted)} aceptados (de {len(video_ids)} IDs)")
+
 
 
 def collect_video_ids_from_queries(
@@ -890,29 +997,36 @@ if __name__ == "__main__":
     if os.getenv("CLEANUP_ON_START", "0") == "1":
         cleanup_from_db_catalog(db)
 
-    ids_env = os.getenv("YT_IDS", "").strip()
-    if ids_env:
-        ids = [x.strip() for x in ids_env.split(",") if x.strip()]
-        print(f"[RUN] IDs recibidos: {len(ids)}")
-        process_ids(ids)
+    # 1) PRIORIDAD: leer IDs desde datos.txt si existe
+    file_ids = load_ids_from_file(DATOS_FILE)
+    if file_ids:
+        print(f"[RUN] Procesando IDs desde {DATOS_FILE}…")
+        # ❗Aquí NO queremos ni gates ni enrich (no API):
+        process_ids(file_ids, use_gates=False, use_enrich=False)
     else:
-        topics_env = os.getenv(
-            "YT_TOPICS",
-            "cocina manos, barista espresso, planchar ropa, organización de ropa, fold clothes kitchen"
-        )
-        base_queries = [q.strip() for q in topics_env.split(",") if q.strip()]
+        # 2) Si no hay datos.txt, seguimos con el comportamiento anterior
+        ids_env = os.getenv("YT_IDS", "").strip()
+        if ids_env:
+            ids = [x.strip() for x in ids_env.split(",") if x.strip()]
+            print(f"[RUN] IDs recibidos desde YT_IDS: {len(ids)}")
+            # Aquí sí puedes seguir usando gates+enrich normales
+            process_ids(ids, use_gates=True, use_enrich=True)
+        else:
+            topics_env = os.getenv(
+                "YT_TOPICS",
+                "cocina manos, videos de cocina manos, barista espresso, "
+                "planchar ropa, organización de ropa, fold clothes kitchen"
+            )
+            base_queries = [q.strip() for q in topics_env.split(",") if q.strip()]
 
-        target_accepts = int(os.getenv("TARGET_ACCEPTS", "50"))
-        max_attempts   = int(os.getenv("MAX_ATTEMPTS", "12"))
-        per_query_lim  = int(os.getenv("PER_QUERY_LIMIT", "25"))
+            target_accepts = int(os.getenv("TARGET_ACCEPTS", "50"))
+            max_attempts   = int(os.getenv("MAX_ATTEMPTS", "12"))
+            per_query_lim  = int(os.getenv("PER_QUERY_LIMIT", "25"))
 
-        process_until_target_with_small_changes(
-            base_queries,
-            target_accepts=target_accepts,
-            max_attempts=max_attempts,
-            per_query_limit=per_query_lim
-        )
-
-
-
+            process_until_target_with_small_changes(
+                base_queries,
+                target_accepts=target_accepts,
+                max_attempts=max_attempts,
+                per_query_limit=per_query_lim,
+            )
 
